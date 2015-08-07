@@ -28,7 +28,8 @@ avro_schema_t schema_for_timestamp(bool with_tz);
 avro_schema_t schema_for_interval(void);
 void schema_for_date_fields(avro_schema_t record_schema);
 void schema_for_time_fields(avro_schema_t record_schema);
-avro_schema_t schema_for_special_times(avro_schema_t record_schema);
+avro_schema_t union_schema_for_special_times(avro_schema_t record_schema, avro_schema_t enum_schema);
+avro_schema_t schema_for_special_times(void);
 
 int update_avro_with_datum(avro_value_t *output_val, Oid typid, Datum pg_datum);
 int update_avro_with_date(avro_value_t *union_val, DateADT date);
@@ -39,6 +40,10 @@ int update_avro_with_bytes(avro_value_t *output_val, bytea *bytes);
 int update_avro_with_char(avro_value_t *output_val, char c);
 int update_avro_with_string(avro_value_t *output_val, Oid typid, Datum pg_datum);
 
+static avro_schema_t initial_schema_for_timestamp_with_tz = NULL;
+static avro_schema_t initial_schema_for_timestamp_without_tz = NULL;
+static avro_schema_t initial_schema_for_special_times = NULL;
+static avro_schema_t initial_schema_for_date = NULL;
 
 /* Returns the relation object for the index that we're going to use as key for a
  * particular table. (Indexes are relations too!) Returns null if the table is unkeyed.
@@ -210,7 +215,7 @@ int tuple_to_avro_key(avro_value_t *output_val, TupleDesc tupdesc, HeapTuple tup
 /* Generates an Avro schema that can be used to encode a Postgres type
  * with the given OID. */
 avro_schema_t schema_for_oid(Oid typid) {
-    avro_schema_t value_schema, null_schema, union_schema;
+    avro_schema_t value_schema, null_schema, union_schema, enum_schema;
 
     switch (typid) {
         /* Numeric-like types */
@@ -242,7 +247,19 @@ avro_schema_t schema_for_oid(Oid typid) {
         /* Date/time types. We don't bother with abstime, reltime and tinterval (which are based
          * on Unix timestamps with 1-second resolution), as they are deprecated. */
         case DATEOID:        /* date: 32-bit signed integer, resolution of 1 day */
-            return schema_for_date();
+            if (!initial_schema_for_date) {
+                initial_schema_for_date = schema_for_date();
+                value_schema = initial_schema_for_date;
+            } else {
+                value_schema = avro_schema_link(initial_schema_for_date);
+            }
+            if (!initial_schema_for_special_times) {
+                initial_schema_for_special_times = schema_for_special_times();
+                enum_schema = initial_schema_for_special_times;
+            } else {
+                enum_schema = avro_schema_link(initial_schema_for_special_times);
+            }
+            return union_schema_for_special_times(value_schema, enum_schema);
         case TIMEOID:        /* time without time zone: microseconds since start of day */
             value_schema = avro_schema_long();
             break;
@@ -250,9 +267,33 @@ avro_schema_t schema_for_oid(Oid typid) {
             value_schema = schema_for_time_tz();
             break;
         case TIMESTAMPOID:   /* timestamp without time zone: datetime, microseconds since epoch */
-            return schema_for_timestamp(false);
+            if (!initial_schema_for_timestamp_without_tz) {
+                initial_schema_for_timestamp_without_tz = schema_for_timestamp(false);
+                value_schema = initial_schema_for_timestamp_without_tz;
+            } else {
+                value_schema = avro_schema_link(initial_schema_for_timestamp_without_tz);
+            }
+            if (!initial_schema_for_special_times) {
+                initial_schema_for_special_times = schema_for_special_times();
+                enum_schema = initial_schema_for_special_times;
+            } else {
+                enum_schema = avro_schema_link(initial_schema_for_special_times);
+            }
+            return union_schema_for_special_times(value_schema, enum_schema);
         case TIMESTAMPTZOID: /* timestamp with time zone, timestamptz: datetime with time zone */
-            return schema_for_timestamp(true);
+            if (!initial_schema_for_timestamp_with_tz) {
+                initial_schema_for_timestamp_with_tz = schema_for_timestamp(true);
+                value_schema = initial_schema_for_timestamp_with_tz;
+            } else {
+                value_schema = avro_schema_link(initial_schema_for_timestamp_with_tz);
+            }
+            if (!initial_schema_for_special_times) {
+                initial_schema_for_special_times = schema_for_special_times();
+                enum_schema = initial_schema_for_special_times;
+            } else {
+                enum_schema = avro_schema_link(initial_schema_for_special_times);
+            }
+            return union_schema_for_special_times(value_schema, enum_schema);
         case INTERVALOID:    /* @ <number> <units>, time interval */
             value_schema = schema_for_interval();
             break;
@@ -400,8 +441,18 @@ avro_schema_t schema_for_numeric() {
     return avro_schema_double(); /* FIXME use decimal logical type: http://avro.apache.org/docs/1.7.7/spec.html#Decimal */
 }
 
-avro_schema_t schema_for_special_times(avro_schema_t record_schema) {
-    avro_schema_t union_schema, null_schema, enum_schema;
+avro_schema_t schema_for_special_times() {
+    avro_schema_t enum_schema;
+
+    enum_schema = avro_schema_enum("SpecialTime");
+    avro_schema_enum_symbol_append(enum_schema, "POS_INFINITY");
+    avro_schema_enum_symbol_append(enum_schema, "NEG_INFINITY");
+
+    return enum_schema;
+}
+
+avro_schema_t union_schema_for_special_times(avro_schema_t record_schema, avro_schema_t enum_schema) {
+    avro_schema_t union_schema, null_schema;
 
     union_schema = avro_schema_union();
     null_schema = avro_schema_null();
@@ -411,9 +462,6 @@ avro_schema_t schema_for_special_times(avro_schema_t record_schema) {
     avro_schema_union_append(union_schema, record_schema);
     avro_schema_decref(record_schema);
 
-    enum_schema = avro_schema_enum("SpecialTime"); // TODO needs namespace
-    avro_schema_enum_symbol_append(enum_schema, "POS_INFINITY");
-    avro_schema_enum_symbol_append(enum_schema, "NEG_INFINITY");
     avro_schema_union_append(union_schema, enum_schema);
     avro_schema_decref(enum_schema);
     return union_schema;
@@ -454,7 +502,8 @@ void schema_for_time_fields(avro_schema_t record_schema) {
 avro_schema_t schema_for_date() {
     avro_schema_t record_schema = avro_schema_record("Date", PREDEFINED_SCHEMA_NAMESPACE);
     schema_for_date_fields(record_schema);
-    return schema_for_special_times(record_schema);
+
+    return record_schema;
 }
 
 int update_avro_with_date(avro_value_t *union_val, DateADT date) {
@@ -552,7 +601,8 @@ avro_schema_t schema_for_timestamp(bool with_tz) {
         avro_schema_record_field_append(record_schema, "zoneOffset", column_schema);
         avro_schema_decref(column_schema);
     }
-    return schema_for_special_times(record_schema);
+
+    return record_schema;
 }
 
 int update_avro_with_timestamp(avro_value_t *union_val, bool with_tz, Timestamp timestamp) {
